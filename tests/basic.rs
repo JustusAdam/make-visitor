@@ -4,9 +4,9 @@ use std::collections::HashSet;
 
 cv::make_visitor! {
     #[derive(Clone)]
-    struct Name(&'static str);
-    struct Value(usize);
-    struct Binding {
+    pub struct Name(&'static str);
+    pub struct Value(usize);
+    pub struct Binding {
         name: Name,
         value: Value,
         hidden: usize,
@@ -20,6 +20,7 @@ cv::make_visitor! {
 
 #[test]
 fn test_binding() {
+    use visit::*;
     struct V(Vec<String>);
 
     impl Visitor for V {

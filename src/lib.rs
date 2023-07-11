@@ -11,10 +11,41 @@ use proc_macro2::{Ident, Span, TokenStream};
 use quote::quote;
 use std::collections::HashSet;
 use syn::spanned::Spanned;
-use syn::{
+use syn::visit::Visit;
+use syn::{Variant, Visibility};
+use syn::{Token,
     parse_macro_input, punctuated::Punctuated, Field, Fields, GenericArgument, Index, Item, Member,
-    Path, PathArguments, Type, TypeArray, TypePath, TypeSlice,
+    Path, PathArguments, Type, TypeArray, TypeSlice,
 };
+
+struct Options<'ast> {
+    generate_variant_visitors: bool,
+    in_mod: Option<Ident>,
+    visibility: &'ast Visibility,
+}
+
+
+struct Generator<'a> {
+    options: Options<'a>,
+    available_types: HashSet<&'a Ident>,
+    visitor_methods: Vec<TokenStream>,
+    visit_functions: Vec<TokenStream>,
+    variant_stack: Option<Vec<(&'a Variant, TokenStream)>>,
+    diagnostics: Vec<Diagnostic>,
+}
+
+impl<'a> Generator<'a> {
+    fn new(options: Options<'a>, available_types: HashSet<&'a Ident>) -> Self {
+        Self {
+            options,
+            available_types,
+            visit_functions: vec![],
+            visitor_methods: vec![],
+            variant_stack: None,
+            diagnostics: vec![],
+        }
+    }
+}
 
 fn as_camel(s: &str) -> String {
     let mut new = String::with_capacity(s.len());
@@ -54,48 +85,6 @@ fn field_names<'a>(
     })
 }
 
-fn handle_variant(
-    available_types: &HashSet<&Ident>,
-    ident: &Ident,
-    fields: &Fields,
-) -> Result<(TokenStream, TokenStream), Diagnostic> {
-    let name = to_visit_method(&ident);
-    let args = field_names(fields.iter()).collect::<Vec<_>>();
-    let ref types = fields.iter().map(|field| &field.ty).collect::<Vec<_>>();
-
-    let method_calls = args
-        .iter()
-        .zip(types)
-        .filter_map(|(field, ty)| handle_type(available_types, ty, &quote!(#field)).ok());
-    Ok((
-        quote!(
-            fn #name(&mut self, #(#args:&#types),*) {
-                #name(self, #(#args),*)
-            }
-        ),
-        quote!(
-            pub fn #name<V:Visitor + ?Sized>(v: &mut V, #(#args : &#types),*) {
-                #(
-                    #method_calls
-                );*
-            }
-        ),
-    ))
-}
-
-fn handle_array_like(
-    available_types: &HashSet<&Ident>,
-    elem: &Type,
-    target: &TokenStream,
-) -> Result<TokenStream, Diagnostic> {
-    let inner = handle_type(available_types, &elem, &quote!(it))?;
-    Ok(quote!(
-        for it in (#target).iter() {
-            #inner
-        }
-    ))
-}
-
 fn matches_tail_generic<'a>(
     options: &[&[&str]],
     path: &'a Path,
@@ -127,141 +116,186 @@ fn single_generic_ty<'a>(
     generics.next().is_none().then_some(&inner)
 }
 
-fn handle_type(
-    available_types: &HashSet<&Ident>,
-    typ: &Type,
-    target: &TokenStream,
-) -> Result<TokenStream, Diagnostic> {
-    let target = &target;
-    match typ {
-        Type::Array(TypeArray { elem, .. }) | Type::Slice(TypeSlice { elem, .. }) => {
-            handle_array_like(available_types, elem.as_ref(), target)
-        }
-        Type::Paren(ty) => handle_type(available_types, &ty.elem, target),
-        Type::Reference(rf) => {
-            let inner = rf.elem.as_ref();
-            match inner {
-                Type::Slice(slc) => handle_array_like(available_types, &slc.elem, target),
-                _ => handle_type(available_types, inner, &quote!(*#target)),
+impl<'ast> Visit<'ast> for Generator<'ast> {
+    fn visit_item_struct(&mut self, strct: &'ast syn::ItemStruct) {
+        let visit_name = to_visit_method(&strct.ident);
+        let ty = &strct.ident;
+        let visit_fields = strct
+            .fields
+            .iter()
+            .filter_map(|f| {
+                let field = &f.ident;
+                self.handle_type(&f.ty, &quote!(&i.#field)).ok()
+            })
+            .collect::<Vec<_>>();
+        let vis = self.options.visibility;
+        self.add_visitor_method(quote!(
+            fn #visit_name(&mut self, i: &#ty) {
+                #visit_name(self, i)
             }
-        }
-        Type::Tuple(tup) => {
-            let for_fields = tup
-                .elems
-                .iter()
-                .enumerate()
-                .map(|(index, ty)| {
-                    let idx = Member::Unnamed(Index {
-                        index: index as u32,
-                        span: Span::call_site(),
-                    });
-                    handle_type(available_types, ty, &quote!(&(#target).#idx))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(quote!(#(#for_fields);*))
-        }
-        Type::Path(path) => path
-            .path
-            .get_ident()
-            .and_then(|id| {
-                available_types.contains(id).then(|| {
-                    let visit_name = to_visit_method(id);
-                    quote!(v.#visit_name(#target))
-                })
+        ));
+        self.add_visit_function(quote!(
+            #vis fn #visit_name<V: Visitor + ?Sized>(v: &mut V, i: &#ty) {
+                #(#visit_fields);*
+            }
+        ))
+    }
+
+    fn visit_variant(&mut self, variant: &'ast Variant) {
+        let empty = Punctuated::new();
+        let fields = match &variant.fields {
+            Fields::Named(flds) => &flds.named,
+            Fields::Unnamed(flds) => &flds.unnamed,
+            Fields::Unit => &empty,
+        };
+        let name = to_visit_method(&variant.ident);
+        let args = field_names(fields.iter()).collect::<Vec<_>>();
+        let ref types = fields.iter().map(|field| &field.ty).collect::<Vec<_>>();
+        let method_calls = args
+            .iter()
+            .zip(types)
+            .filter_map(|(field, ty)| self.handle_type(ty, &quote!(#field)).ok())
+            .collect::<Vec<_>>();
+        let vis = self.options.visibility;
+        let inner = if self.options.generate_variant_visitors {
+            self.add_visitor_method(quote!(
+                fn #name(&mut self, #(#args:&#types),*) {
+                    #name(self, #(#args),*)
+                }
+            ));
+            self.add_visit_function(quote!(
+                #vis fn #name<V:Visitor + ?Sized>(v: &mut V, #(#args : &#types),*) {
+                    #(
+                        #method_calls
+                    );*
+                }
+            ));
+            quote!(v.#name(#(#args),*))
+        } else {
+            quote!({
+                #(#method_calls);*
             })
-            .or_else(|| {
-                matches_tail_generic(
-                    &[&["Vec"], &["std", "alloc", "vec"], &["std", "vec", "vec"]],
-                    &path.path,
-                )
-                .and_then(single_generic_ty)
-                .and_then(|ty| handle_array_like(available_types, ty, target).ok())
-            })
-            .or_else(|| {
-                matches_tail_generic(&[&["Box"], &["std", "box", "Box"]], &path.path)
-                    .and_then(single_generic_ty)
-                    .and_then(|ty| {
-                        handle_type(available_types, ty, &quote!((#target).as_ref())).ok()
-                    })
-            })
-            .ok_or_else(|| typ.span().unwrap().warning("Unknown path type")),
-        _ => Err(typ.span().unwrap().warning("Unsupported type")),
+        };
+        self.variant_stack.as_mut().unwrap().push((variant, inner));
+    }
+
+    fn visit_item_enum(&mut self, enm: &'ast syn::ItemEnum) {
+        assert!(self.variant_stack.replace(vec![]).is_none());
+        syn::visit::visit_item_enum(self, enm);
+        let stack = self.variant_stack.take().unwrap();
+        let visit_name = to_visit_method(&enm.ident);
+        let enum_name = &enm.ident;
+        let matches = stack.into_iter().map(|(variant, inner)| {
+            let empty = Punctuated::new();
+            let fields = match &variant.fields {
+                Fields::Named(flds) => &flds.named,
+                Fields::Unnamed(flds) => &flds.unnamed,
+                Fields::Unit => &empty,
+            };
+            let var_name = &variant.ident;
+            let fields = field_names(fields.iter()).collect::<Vec<_>>();
+            match &variant.fields {
+                Fields::Named(_) => {
+                    quote!(#enum_name::#var_name{ #(#fields),* } => #inner)
+                }
+                Fields::Unnamed(_) => {
+                    quote!(#enum_name::#var_name(#(#fields),*) => #inner)
+                }
+                Fields::Unit => quote!(#enum_name::#var_name => ()),
+            }
+        });
+        let vis = self.options.visibility;
+        self.add_visitor_method(quote!(
+            fn #visit_name(&mut self, i: &#enum_name) {
+                #visit_name(self, i)
+            }
+        ));
+        self.add_visit_function(quote!(
+            #vis fn #visit_name<V: Visitor + ?Sized>(v: &mut V, i: &#enum_name) {
+                match i {
+                    #(#matches),*
+                }
+            }
+        ));
     }
 }
 
-fn handle_item(
-    available_types: &HashSet<&Ident>,
-    item: &syn::Item,
-) -> Result<(TokenStream, TokenStream), Diagnostic> {
-    match item {
-        Item::Struct(strct) => {
-            let visit_name = to_visit_method(&strct.ident);
-            let ty = &strct.ident;
-            let visit_fields = strct.fields.iter().filter_map(|f| {
-                let field = &f.ident;
-                handle_type(available_types, &f.ty, &quote!(&i.#field)).ok()
-            });
-            Ok((
-                quote!(
-                    fn #visit_name(&mut self, i: &#ty) {
-                        #visit_name(self, i)
-                    }
-                ),
-                quote!(
-                    fn #visit_name<V: Visitor + ?Sized>(v: &mut V, i: &#ty) {
-                        #(#visit_fields);*
-                    }
-                ),
-            ))
-        }
-        Item::Enum(enm) => {
-            let visit_name = to_visit_method(&enm.ident);
-            let enum_name = &enm.ident;
-            let matches = enm.variants.iter().map(|var| {
-                let empty = Punctuated::new();
-                let fields = match &var.fields {
-                    Fields::Named(flds) => &flds.named,
-                    Fields::Unnamed(flds) => &flds.unnamed,
-                    Fields::Unit => &empty,
-                };
-                let var_name = &var.ident;
-                let handle_var = to_visit_method(var_name);
-                let fields = field_names(fields.iter()).collect::<Vec<_>>();
-                match &var.fields {
-                    Fields::Named(_) => {
-                        quote!(#enum_name::#var_name{ #(#fields),* } => v.#handle_var(#(#fields),*))
-                    }
-                    Fields::Unnamed(_) => {
-                        quote!(#enum_name::#var_name(#(#fields),*) => v.#handle_var(#(#fields),*))
-                    }
-                    Fields::Unit => quote!(#enum_name::#var_name => ()),
+impl<'a> Generator<'a> {
+    fn add_visit_function(&mut self, function: TokenStream) {
+        self.visit_functions.push(function)
+    }
+
+    fn add_visitor_method(&mut self, function: TokenStream) {
+        self.visitor_methods.push(function)
+    }
+
+    fn handle_array_like(
+        &self,
+        elem: &Type,
+        target: &TokenStream,
+    ) -> Result<TokenStream, Diagnostic> {
+        let inner = self.handle_type(&elem, &quote!(it))?;
+        Ok(quote!(
+            for it in (#target).iter() {
+                #inner
+            }
+        ))
+    }
+
+    fn handle_type(&self, typ: &Type, target: &TokenStream) -> Result<TokenStream, Diagnostic> {
+        let target = &target;
+        match typ {
+            Type::Array(TypeArray { elem, .. }) | Type::Slice(TypeSlice { elem, .. }) => {
+                self.handle_array_like(elem.as_ref(), target)
+            }
+            Type::Paren(ty) => self.handle_type(&ty.elem, target),
+            Type::Reference(rf) => {
+                let inner = rf.elem.as_ref();
+                match inner {
+                    Type::Slice(slc) => self.handle_array_like(&slc.elem, target),
+                    _ => self.handle_type(inner, &quote!(*#target)),
                 }
-            });
-            let selfvisit = (
-                quote!(
-                    fn #visit_name(&mut self, i: &#enum_name) {
-                        #visit_name(self, i)
-                    }
-                ),
-                quote!(
-                    fn #visit_name<V: Visitor + ?Sized>(v: &mut V, i: &#enum_name) {
-                        match i {
-                            #(#matches),*
-                        }
-                    }
-                ),
-            );
-            enm.variants
-                .iter()
-                .map(|var| handle_variant(available_types, &var.ident, &var.fields))
-                .chain([Ok(selfvisit)])
-                .collect::<Result<Vec<_>, _>>()
-                .map(|res| res.into_iter().unzip())
+            }
+            Type::Tuple(tup) => {
+                let for_fields = tup
+                    .elems
+                    .iter()
+                    .enumerate()
+                    .map(|(index, ty)| {
+                        let idx = Member::Unnamed(Index {
+                            index: index as u32,
+                            span: Span::call_site(),
+                        });
+                        self.handle_type(ty, &quote!(&(#target).#idx))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(quote!(#(#for_fields);*))
+            }
+            Type::Path(path) => path
+                .path
+                .get_ident()
+                .and_then(|id| {
+                    self.available_types.contains(id).then(|| {
+                        let visit_name = to_visit_method(id);
+                        quote!(v.#visit_name(#target))
+                    })
+                })
+                .or_else(|| {
+                    matches_tail_generic(
+                        &[&["Vec"], &["std", "alloc", "vec"], &["std", "vec", "vec"]],
+                        &path.path,
+                    )
+                    .and_then(single_generic_ty)
+                    .and_then(|ty| self.handle_array_like(ty, target).ok())
+                })
+                .or_else(|| {
+                    matches_tail_generic(&[&["Box"], &["std", "box", "Box"]], &path.path)
+                        .and_then(single_generic_ty)
+                        .and_then(|ty| self.handle_type(ty, &quote!((#target).as_ref())).ok())
+                })
+                .ok_or_else(|| typ.span().unwrap().warning("Unknown path type")),
+            _ => Err(typ.span().unwrap().warning("Unsupported type")),
         }
-        _ => Err(item
-            .span()
-            .unwrap()
-            .error("Unsupported item type, expected struct or enum")),
     }
 }
 
@@ -289,27 +323,91 @@ pub fn make_visitor(items: TokenStream2) -> TokenStream2 {
         })
         .collect::<HashSet<_>>();
 
-    let (visit_methods, visit_functions): (TokenStream, TokenStream) = match items
-        .iter()
-        .map(|item| handle_item(&available_types, item))
-        .collect::<Result<Vec<_>, _>>()
-    {
-        Ok(visitors) => visitors.into_iter().unzip(),
-        Err(diagnostic) => {
-            diagnostic.emit();
-            panic!()
+    let requested_visibility = items.iter().filter_map(|it| 
+        match it {
+            Item::Enum(e) => Some(&e.vis),
+            Item::Struct(s) => Some(&s.vis),
+            _ => None,
         }
+    ).reduce(|vis1, vis2| {
+        match (vis1, vis2) {
+            (Visibility::Inherited, _) => vis1,
+            (Visibility::Public(_), _) => vis2,
+            (_, Visibility::Public(_)) => vis1,
+            (_, Visibility::Inherited) => vis2,
+            (Visibility::Restricted(r1), Visibility::Restricted(r2)) => {
+                if r2.path.leading_colon.is_some() == r2.path.leading_colon.is_some()
+                    && r1.path.segments.iter().zip(r2.path.segments.iter()).all(|(p1, p2)| p1 == p2) {
+                    if r1.path.segments.len() > r2.path.segments.len() {
+                        vis1
+                    } else {
+                        vis2
+                    }
+                } else {
+                    vis1.span().join(vis2.span()).unwrap().unwrap().error("Unreconsilable visibilities").emit();
+                    panic!()
+                }
+            }
+        }
+    });
+
+    let default_vis = Visibility::Public(Token![pub](Span::call_site()));
+
+    let mut options = 
+        Options {
+            generate_variant_visitors: false,
+            in_mod: Some(syn::parse_str("visit").unwrap()),
+            visibility: &default_vis,
+        };
+
+    // requested_visibility.map(|vis|
+    //     options.visibility = vis
+    // );
+
+    let mut generator = Generator::new(options, available_types);
+
+    for i in &items {
+        generator.visit_item(i);
+    }
+
+    let visit_methods = generator.visitor_methods;
+    let visit_functions = generator.visit_functions;
+
+    let has_diags = !generator.diagnostics.is_empty();
+    for diag in generator.diagnostics {
+        diag.emit();
+    }
+    if has_diags {
+        panic!()
+    }
+
+    let all_functions = quote!(
+        pub trait Visitor {
+            #(#visit_methods)*
+        }
+
+        #(#visit_functions)*
+    );
+
+    let available_types = generator.available_types.iter();
+
+    let inner = if let Some(path) = generator.options.in_mod {
+        quote!(
+            mod #path {
+                use super::{
+                    #(#available_types),*
+                };
+                #all_functions
+            }
+        )
+    } else {
+        all_functions
     };
 
-    let out = quote!(
+    quote!(
         #(#items)*
 
-        trait Visitor {
-            #visit_methods
-        }
-
-        #visit_functions
-    );
-    print!("{out}");
-    out.into()
+        #inner
+    )
+    .into()
 }

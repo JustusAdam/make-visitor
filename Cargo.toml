@@ -9,7 +9,7 @@ edition = "2021"
 proc-macro = true
 
 [dependencies]
-syn = { version = "2", features = ["full"] }
+syn = { version = "2", features = ["full", "visit", "extra-traits"] }
 proc-macro2 = "1"
 quote = "1"
 either = "1.8"
