@@ -12,18 +12,17 @@ use quote::quote;
 use std::collections::HashSet;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
-use syn::{Variant, Visibility};
-use syn::{Token,
+use syn::{
     parse_macro_input, punctuated::Punctuated, Field, Fields, GenericArgument, Index, Item, Member,
-    Path, PathArguments, Type, TypeArray, TypeSlice,
+    Path, PathArguments, Token, Type, TypeArray, TypeSlice,
 };
+use syn::{Variant, Visibility};
 
 struct Options<'ast> {
     generate_variant_visitors: bool,
     in_mod: Option<Ident>,
     visibility: &'ast Visibility,
 }
-
 
 struct Generator<'a> {
     options: Options<'a>,
@@ -123,8 +122,12 @@ impl<'ast> Visit<'ast> for Generator<'ast> {
         let visit_fields = strct
             .fields
             .iter()
-            .filter_map(|f| {
-                let field = &f.ident;
+            .enumerate()
+            .filter_map(|(i, f)| {
+                let field = f
+                    .ident
+                    .clone()
+                    .map_or(Member::Unnamed(i.into()), Member::Named);
                 self.handle_type(&f.ty, &quote!(&i.#field)).ok()
             })
             .collect::<Vec<_>>();
@@ -291,7 +294,7 @@ impl<'a> Generator<'a> {
                 .or_else(|| {
                     matches_tail_generic(&[&["Box"], &["std", "box", "Box"]], &path.path)
                         .and_then(single_generic_ty)
-                        .and_then(|ty| self.handle_type(ty, &quote!((#target).as_ref())).ok())
+                        .and_then(|ty| self.handle_type(ty, &quote!((#target).borrow())).ok())
                 })
                 .ok_or_else(|| typ.span().unwrap().warning("Unknown path type")),
             _ => Err(typ.span().unwrap().warning("Unsupported type")),
@@ -323,42 +326,51 @@ pub fn make_visitor(items: TokenStream2) -> TokenStream2 {
         })
         .collect::<HashSet<_>>();
 
-    let requested_visibility = items.iter().filter_map(|it| 
-        match it {
+    let _requested_visibility = items
+        .iter()
+        .filter_map(|it| match it {
             Item::Enum(e) => Some(&e.vis),
             Item::Struct(s) => Some(&s.vis),
             _ => None,
-        }
-    ).reduce(|vis1, vis2| {
-        match (vis1, vis2) {
+        })
+        .reduce(|vis1, vis2| match (vis1, vis2) {
             (Visibility::Inherited, _) => vis1,
             (Visibility::Public(_), _) => vis2,
             (_, Visibility::Public(_)) => vis1,
             (_, Visibility::Inherited) => vis2,
             (Visibility::Restricted(r1), Visibility::Restricted(r2)) => {
                 if r2.path.leading_colon.is_some() == r2.path.leading_colon.is_some()
-                    && r1.path.segments.iter().zip(r2.path.segments.iter()).all(|(p1, p2)| p1 == p2) {
+                    && r1
+                        .path
+                        .segments
+                        .iter()
+                        .zip(r2.path.segments.iter())
+                        .all(|(p1, p2)| p1 == p2)
+                {
                     if r1.path.segments.len() > r2.path.segments.len() {
                         vis1
                     } else {
                         vis2
                     }
                 } else {
-                    vis1.span().join(vis2.span()).unwrap().unwrap().error("Unreconsilable visibilities").emit();
+                    vis1.span()
+                        .join(vis2.span())
+                        .unwrap()
+                        .unwrap()
+                        .error("Unreconsilable visibilities")
+                        .emit();
                     panic!()
                 }
             }
-        }
-    });
+        });
 
     let default_vis = Visibility::Public(Token![pub](Span::call_site()));
 
-    let mut options = 
-        Options {
-            generate_variant_visitors: false,
-            in_mod: Some(syn::parse_str("visit").unwrap()),
-            visibility: &default_vis,
-        };
+    let mut options = Options {
+        generate_variant_visitors: false,
+        in_mod: Some(syn::parse_str("visit").unwrap()),
+        visibility: &default_vis,
+    };
 
     // requested_visibility.map(|vis|
     //     options.visibility = vis
@@ -382,6 +394,7 @@ pub fn make_visitor(items: TokenStream2) -> TokenStream2 {
     }
 
     let all_functions = quote!(
+        use std::borrow::Borrow;
         pub trait Visitor {
             #(#visit_methods)*
         }
@@ -404,10 +417,11 @@ pub fn make_visitor(items: TokenStream2) -> TokenStream2 {
         all_functions
     };
 
-    quote!(
+    let out = quote!(
         #(#items)*
 
         #inner
-    )
-    .into()
+    );
+    println!("{out}");
+    out.into()
 }

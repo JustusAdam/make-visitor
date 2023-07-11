@@ -1,8 +1,8 @@
-extern crate cv;
+extern crate make_visitor;
 
 use std::collections::HashSet;
 
-cv::make_visitor! {
+make_visitor::make_visitor! {
     #[derive(Clone)]
     pub struct Name(&'static str);
     pub struct Value(usize);

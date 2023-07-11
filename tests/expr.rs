@@ -1,4 +1,4 @@
-extern crate cv;
+extern crate make_visitor;
 
 type InternedString = &'static str;
 type Location = ();
@@ -6,7 +6,7 @@ type Parameter = ();
 type Type = ();
 type BigInt = ();
 
-cv::make_visitor!(
+make_visitor::make_visitor!(
     #[derive(Clone, Debug)]
     pub struct Expr {
         value: Box<ExprValue>,

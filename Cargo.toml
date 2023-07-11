@@ -1,5 +1,5 @@
 [package]
-name = "cv"
+name = "make-visitor"
 version = "0.1.0"
 edition = "2021"
 
